@@ -4,6 +4,7 @@ import fs from "fs";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
+import { getAddress } from 'ethers'; 
 
 const API_BASE_URL = "https://campapi.diamante.io/api/v1";
 const CONFIG_FILE = "config.json";
@@ -193,6 +194,17 @@ function loadAddresses() {
   try {
     const data = fs.readFileSync("user.txt", "utf8");
     addresses = data.split("\n").map(addr => addr.trim()).filter(addr => addr.match(/^0x[0-9a-fA-F]{40}$/));
+    addresses = addresses.map(addr => {
+      try {
+        const checksummed = getAddress(addr);
+        addLog(`Converted address ${getShortAddress(addr)} to checksum: ${getShortAddress(checksummed)}`, "debug");
+        return checksummed;
+      } catch (error) {
+        addLog(`Invalid address format: ${addr} - Skipping. Error: ${error.message}`, "error");
+        return null;
+      }
+    }).filter(Boolean);
+
     if (addresses.length === 0) throw new Error("No valid address in user.txt");
     addLog(`Loaded ${addresses.length} address from user.txt`, "success");
   } catch (error) {
@@ -216,7 +228,16 @@ function loadProxies() {
 function loadRecipientAddresses() {
   try {
     const data = fs.readFileSync("wallet.txt", "utf8");
-    const recipients = data.split("\n").map(addr => addr.trim()).filter(addr => addr.match(/^0x[0-9a-fA-F]{40}$/));
+    let recipients = data.split("\n").map(addr => addr.trim()).filter(addr => addr.match(/^0x[0-9a-fA-F]{40}$/));
+    recipients = recipients.map(addr => {
+      try {
+        return getAddress(addr);
+      } catch (error) {
+        addLog(`Invalid recipient address: ${addr} - Skipping.`, "error");
+        return null;
+      }
+    }).filter(Boolean);
+
     if (recipients.length === 0) throw new Error("No valid addresses in wallet.txt");
     addLog(`Loaded ${recipients.length} recipient addresses from wallet.txt`, "success");
     return recipients;
@@ -306,15 +327,18 @@ async function loginAccount(address, proxyUrl, useProxy = true) {
   }
   try {
     const loginUrl = `${API_BASE_URL}/user/connect-wallet`;
-    let deviceId = accountData[address.toLowerCase()];
+    const checksummedAddress = getAddress(address);
+    addLog(`Logging in with address: ${getShortAddress(address)})`, "debug");
+
+    let deviceId = accountData[checksummedAddress.toLowerCase()]; 
     if (!deviceId) {
       deviceId = `DEV${Math.random().toString(24).substr(2, 5).toUpperCase()}`;
-      addLog(`Generated new deviceId for ${getShortAddress(address)}: ${deviceId}`, "info");
+      addLog(`Generated new deviceId for ${getShortAddress(checksummedAddress)}: ${deviceId}`, "info");
     } else {
-      addLog(`Using existing deviceId for ${getShortAddress(address)}: ${deviceId}`, "info");
+      addLog(`Using existing deviceId for ${getShortAddress(checksummedAddress)}: ${deviceId}`, "info");
     }
     const payload = {
-      "address": address,
+      "address": checksummedAddress,
       "deviceId": deviceId,
       "deviceSource": "web_app",
       "deviceType": "Windows",
@@ -341,30 +365,30 @@ async function loginAccount(address, proxyUrl, useProxy = true) {
         if (match) accessToken = match[1];
       }
       if (!accessToken) {
-        addLog(`Account ${getShortAddress(address)}: Failed to extract access_token from cookies.`, "error");
+        addLog(`Account ${getShortAddress(checksummedAddress)}: Failed to extract access_token from cookies.`, "error");
         return false;
       }
-      accountTokens[address] = {
+      accountTokens[checksummedAddress] = { 
         userId,
         accessToken
       };
-      if (!accountData[address.toLowerCase()]) {
-        accountData[address.toLowerCase()] = deviceId;
+      if (!accountData[checksummedAddress.toLowerCase()]) {
+        accountData[checksummedAddress.toLowerCase()] = deviceId;
         saveAccountData();
       }
       if (response.data.data.isSocialExists === "VERIFIED") {
-        addLog(`Account ${getShortAddress(address)}: Login Successfully`, "success");
+        addLog(`Account ${getShortAddress(checksummedAddress)}: Login Successfully`, "success");
         await updateWallets();
         return true;
       } else if (response.data.data.isSocialExists === "INITIAL") {
-        addLog(`Account ${getShortAddress(address)}: Not Registed Yet.`, "error");
+        addLog(`Account ${getShortAddress(checksummedAddress)}: Not Registered Yet.`, "error");
         return false;
       } else {
-        addLog(`Account ${getShortAddress(address)}: Unexpected state: ${response.data.data.isSocialExists}`, "error");
+        addLog(`Account ${getShortAddress(checksummedAddress)}: Unexpected state: ${response.data.data.isSocialExists}`, "error");
         return false;
       }
     } else {
-      addLog(`Account ${getShortAddress(address)}: Login failed: ${response.data.message}`, "error");
+      addLog(`Account ${getShortAddress(checksummedAddress)}: Login failed: ${response.data.message}`, "error");
       return false;
     }
   } catch (error) {
@@ -455,7 +479,7 @@ async function performSendDiam(address, proxyUrl, recipient, amount) {
   try {
     const sendUrl = `${API_BASE_URL}/transaction/transfer`;
     const payload = {
-      "toAddress": recipient,
+      "toAddress": recipient, 
       "amount": amount,
       "userId": userId
     };
