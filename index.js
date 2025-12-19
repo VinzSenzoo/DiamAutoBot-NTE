@@ -726,7 +726,7 @@ async function runDailyActivity() {
             const success = await performSendDiam(address, proxyUrl, recipient, amountFixed);
             if (success) successfulTransfers++;
             if (i < dailyActivityConfig.sendDiamRepetitions - 1 && !shouldStop) {
-              const randomDelay = Math.floor(Math.random() * (30000 - 15000 + 1)) + 15000;
+              const randomDelay = Math.floor(Math.random() * (45000 - 30000 + 1)) + 30000;
               addLog(`Account ${accountIndex + 1}: Waiting ${Math.floor(randomDelay / 1000)} seconds before next send...`, "wait");
               await sleep(randomDelay);
             }
@@ -1425,3 +1425,4 @@ setTimeout(() => {
 }, 100);
 
 initialize();
+
