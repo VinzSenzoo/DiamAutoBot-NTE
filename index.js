@@ -20,20 +20,23 @@ const isDebug = false;
 const CONFIG_DEFAULT_HEADERS = {
   "Accept": "application/json, text/plain, */*",
   "Accept-Encoding": "gzip, deflate, br, zstd",
-  "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
-  "Cache-Control": "no-cache",
   "Origin": "https://campaign.diamante.io",
-  "Pragma": "no-cache",
-  "Priority": "u=1, i",
-  "Referer": "https://campaign.diamante.io/",
-  "Sec-Ch-Ua": '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
-  "Sec-Ch-Ua-Mobile": "?0",
-  "Sec-Ch-Ua-Platform": '"Windows"',
-  "Sec-Fetch-Dest": "empty",
-  "Sec-Fetch-Mode": "cors",
-  "Sec-Fetch-Site": "same-site",
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+  "Access-Token": "key",
+  "Referer": "https://campaign.diamante.io/"
 };
+
+function buildHeaders(address = null, extra = {}) {
+  const headers = { ...CONFIG_DEFAULT_HEADERS };
+
+  if (address && accountTokens[address]?.accessToken) {
+    const token = accountTokens[address].accessToken;
+
+    headers["Cookie"] = `access_token=${token}`;
+  }
+
+  return { ...headers, ...extra };
+}
+
 
 let walletInfo = {
   address: "N/A",
@@ -494,19 +497,13 @@ async function loginAccount(address, proxyUrl, useProxy = true) {
 
 async function getBalance(userId, proxyUrl, address) {
   const url = `${API_BASE_URL}/transaction/get-balance/${userId}`;
-  const headers = {
-    "Cookie": `access_token=${accountTokens[address].accessToken}`,
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://campaign.diamante.io",
-    "Referer": "https://campaign.diamante.io/"
-  };
+  const headers = buildHeaders(address);
 
   const res = await callDiamanteAPI(url, "GET", null, headers, proxyUrl);
 
   if (res.status === 200 && res.json?.success) {
     return res.json.data;
   }
-
   throw new Error("Failed get balance");
 }
 
@@ -524,14 +521,9 @@ async function claimFaucetForAccount(address, proxyUrl, accountIndex) {
   for (let attempt = 0; attempt < maxRetries && !shouldStop; attempt++) {
     try {
       const faucetUrl = `${API_BASE_URL}/transaction/fund-wallet/${userId}`;
-      const headers = {
-        "Cookie": `access_token=${accountTokens[address].accessToken}`,
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://campaign.diamante.io",
-        "Referer": "https://campaign.diamante.io/"
-      };
-
+      const headers = buildHeaders(address);
       const res = await callDiamanteAPI(faucetUrl, "GET", null, headers, proxyUrl);
+
 
       if (res.status === 200 && res.json && res.json.success) {
         addLog(`Account ${accountIndex + 1}: DIAM faucet claimed successfully. Funded: ${res.json.data.fundedAmount}`, "success");
@@ -575,13 +567,7 @@ async function getTweetContent(userId, proxyUrl, address) {
   for (let attempt = 0; attempt < maxRetries && !shouldStop; attempt++) {
     try {
       const tweetUrl = `${API_BASE_URL}/transaction/tweet-content/${userId}`;
-      const headers = {
-        "Cookie": `access_token=${accountTokens[address].accessToken}`,
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://campaign.diamante.io",
-        "Referer": "https://campaign.diamante.io/"
-      };
-
+      const headers = buildHeaders(address);
       const res = await callDiamanteAPI(tweetUrl, "GET", null, headers, proxyUrl);
       if (res.status === 200 && res.json && res.json.success) {
         addLog(`Tweet Content: ${res.json.data.content}`, "debug");
@@ -618,13 +604,11 @@ async function performSendDiam(address, proxyUrl, recipient, amount) {
     amount: amount,
     userId: userId
   };
-  const headers = {
-    "Cookie": `access_token=${accountTokens[address].accessToken}`,
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://campaign.diamante.io",
-    "Referer": "https://campaign.diamante.io/"
-  };
+  const headers = buildHeaders(address, {
+    "Content-Type": "application/json"
+  });
+
+
 
   const maxRetries = 6;
   const delays = [2000, 4000, 8000, 15000, 30000, 60000]; 
@@ -726,7 +710,7 @@ async function runDailyActivity() {
             const success = await performSendDiam(address, proxyUrl, recipient, amountFixed);
             if (success) successfulTransfers++;
             if (i < dailyActivityConfig.sendDiamRepetitions - 1 && !shouldStop) {
-              const randomDelay = Math.floor(Math.random() * (45000 - 30000 + 1)) + 30000;
+              const randomDelay = Math.floor(Math.random() * (50000 - 35000 + 1)) + 35000;
               addLog(`Account ${accountIndex + 1}: Waiting ${Math.floor(randomDelay / 1000)} seconds before next send...`, "wait");
               await sleep(randomDelay);
             }
@@ -1425,4 +1409,3 @@ setTimeout(() => {
 }, 100);
 
 initialize();
-
