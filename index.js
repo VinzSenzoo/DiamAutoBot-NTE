@@ -2,8 +2,6 @@ import blessed from "blessed";
 import figlet from "figlet";
 import fs from "fs";
 import axios from "axios";
-import { HttpsProxyAgent } from "https-proxy-agent";
-import { SocksProxyAgent } from "socks-proxy-agent";
 import { getAddress } from 'ethers'; 
 import { execFile } from "child_process";
 import path from "path";
@@ -30,7 +28,6 @@ function buildHeaders(address = null, extra = {}) {
 
   if (address && accountTokens[address]?.accessToken) {
     const token = accountTokens[address].accessToken;
-
     headers["Cookie"] = `access_token=${token}`;
   }
 
@@ -226,9 +223,12 @@ function loadAddresses() {
 function loadProxies() {
   try {
     const data = fs.readFileSync("proxy.txt", "utf8");
-    proxies = data.split("\n").map(proxy => proxy.trim()).filter(proxy => proxy);
+    proxies = data.split(/\r?\n/).map(line => {
+      const t = (line || "").trim();
+      return t === "" ? null : t;
+    });
     if (proxies.length === 0) throw new Error("No proxies found in proxy.txt");
-    addLog(`Loaded ${proxies.length} proxies from proxy.txt`, "success");
+    addLog(`Loaded ${proxies.length} proxy lines from proxy.txt`, "success");
   } catch (error) {
     addLog(`No proxy.txt found or failed to load, running without proxies: ${error.message}`, "warn");
     proxies = [];
@@ -257,76 +257,12 @@ function loadRecipientAddresses() {
   }
 }
 
-function createAgent(proxyUrl) {
-  if (!proxyUrl) return null;
-  if (proxyUrl.startsWith("socks")) {
-    return new SocksProxyAgent(proxyUrl);
-  } else {
-    return new HttpsProxyAgent(proxyUrl);
-  }
-}
 
-async function makeApiRequest(method, url, data, proxyUrl, customHeaders = {}, maxRetries = 3, retryDelay = 2000, useProxy = true) {
-  activeProcesses++;
-  let lastError = null;
-  try {
-    for (let attempt = 1; attempt <= maxRetries && !shouldStop; attempt++) {
-      try {
-        const agent = useProxy && proxyUrl ? createAgent(proxyUrl) : null;
-        const headers = { ...CONFIG_DEFAULT_HEADERS, ...customHeaders };
-        const config = {
-          method,
-          url,
-          data,
-          headers,
-          ...(agent ? { httpsAgent: agent, httpAgent: agent } : {}),
-          timeout: 15000,
-          withCredentials: true,
-          validateStatus: null
-        };
-        const response = await axios(config);
-
-        const contentType = (response.headers && (response.headers['content-type'] || '')).toString();
-
-        if (response.status === 403 && contentType.includes('text/html')) {
-          addLog(`Request blocked by Cloudflare for ${url}`, "error");
-          return response;
-        }
-        if (response.status >= 200 && response.status < 300) {
-          return response;
-        }
-
-        lastError = new Error(`HTTP ${response.status} - ${JSON.stringify(response.data || response.statusText)}`);
-        throw lastError;
-      } catch (error) {
-        if (error && error.response && error.response.status === 403 && ((error.response.headers['content-type'] || '').includes('text/html'))) {
-          addLog(`Blocked by Cloudflare for ${url}`, "error");
-          return error.response;
-        }
-
-        lastError = error;
-        let errorMessage = `Attempt ${attempt}/${maxRetries} failed for API request to ${url}`;
-        if (error && error.response) errorMessage += `: HTTP ${error.response.status} - ${JSON.stringify(error.response.data || error.response.statusText)}`;
-        else if (error && error.request) errorMessage += `: No response received`;
-        else errorMessage += `: ${error && error.message ? error.message : String(error)}`;
-        addLog(errorMessage, "error");
-
-        if (attempt < maxRetries) {
-          addLog(`Retrying API request in ${retryDelay/1000} seconds.`, "wait");
-          await sleep(retryDelay);
-        }
-      }
-    }
-    throw new Error(`Failed to make API request to ${url} after ${maxRetries} attempts: ${lastError && lastError.message ? lastError.message : 'unknown'}`);
-  } finally {
-    activeProcesses = Math.max(0, activeProcesses - 1);
-  }
-}
 
 async function updateWalletData() {
   const walletDataPromises = addresses.map(async (address, i) => {
     try {
-      const proxyUrl = proxies[i % proxies.length] || null;
+      const proxyUrl = getProxyForAccount(i);
       let formattedDIAM = "N/A";
       if (accountTokens[address] && accountTokens[address].userId) {
         const balanceResponse = await getBalance(accountTokens[address].userId, proxyUrl, address);
@@ -349,19 +285,36 @@ async function updateWalletData() {
   return walletData;
 }
 
-function callCurlCffi(payload, proxy = null, impersonate = "chrome110") {
+function callCurlCffi(payload, proxy = null, impersonate = "chrome120") {
   return new Promise((resolve, reject) => {
     const script = path.join(__dirname, "connect.py");
     const args = [JSON.stringify(payload), proxy || "", impersonate || ""];
     execFile("python3", [script, ...args], { maxBuffer: 30 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
-        return reject(new Error(`callCurlCffi exec error: ${err.message} ${stderr || ""}`));
+        const eText = (stderr && String(stderr).trim()) || err.message || "";
+        const resObj = { status: null, status_code: null, text: eText, json: null, headers: {}, error: true, proxy_used: proxy || null };
+        if (isDebug) addLog(`DEBUG callCurlCffi exec error: ${JSON.stringify(resObj)}`, "debug");
+        return resolve(resObj);
       }
       try {
-        const parsed = JSON.parse(stdout);
+        const cleaned = String(stdout || "").trim();
+        const parsed = cleaned ? JSON.parse(cleaned) : {};
+        parsed.status = parsed.status || parsed.status_code || parsed.statusCode || null;
+        parsed.status_code = parsed.status || parsed.status_code || parsed.statusCode || null;
+        parsed.text = (parsed.text !== undefined) ? parsed.text : (parsed.body !== undefined ? parsed.body : "");
+        parsed.json = (parsed.json !== undefined) ? parsed.json : (parsed.response_json !== undefined ? parsed.response_json : null);
+        parsed.headers = parsed.headers || parsed.response_headers || {};
+        parsed.proxy_used = parsed.proxy_used !== undefined ? parsed.proxy_used : (proxy || null);
+
+        if (typeof parsed.status === "string" && parsed.status.match(/^\d+$/)) parsed.status = Number(parsed.status);
+
+        if (isDebug) addLog(`DEBUG callCurlCffi parsed: ${JSON.stringify(parsed)}`, "debug");
         resolve(parsed);
       } catch (e) {
-        return reject(new Error("Failed to parse python helper output: " + e.message + " | stdout: " + stdout));
+        const txt = (stderr && String(stderr).trim()) || String(stdout).slice(0, 100);
+        const resObj = { status: null, text: txt, json: null, headers: {}, error: true, proxy_used: proxy || null };
+        if (isDebug) addLog(`DEBUG callCurlCffi parse failed: ${JSON.stringify(resObj)}`, "debug");
+        resolve(resObj);
       }
     });
   });
@@ -378,15 +331,60 @@ function callDiamanteAPI(url, method, payload, headers, proxy) {
       proxy || ""
     ];
 
-    execFile("python3", [script, ...args], { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return reject(err);
+    execFile("python3", [script, ...args], { maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        const eText = (stderr && String(stderr).trim()) || err.message || "";
+        const resObj = { status: null, text: eText, json: null, headers: {}, error: true, proxy_used: proxy || null };
+        if (isDebug) addLog(`DEBUG callDiamanteAPI exec error: ${JSON.stringify(resObj)}`, "debug");
+        return resolve(resObj);
+      }
       try {
-        resolve(JSON.parse(stdout));
+        const cleaned = String(stdout || "").trim();
+        const parsed = cleaned ? JSON.parse(cleaned) : {};
+
+        parsed.status = parsed.status || parsed.status_code || parsed.statusCode || parsed.code || null;
+        parsed.text = (parsed.text !== undefined) ? parsed.text : (parsed.body !== undefined ? parsed.body : "");
+        parsed.json = (parsed.json !== undefined) ? parsed.json : (parsed.response_json !== undefined ? parsed.response_json : null);
+        parsed.headers = parsed.headers || parsed.response_headers || {};
+        parsed.proxy_used = parsed.proxy_used !== undefined ? parsed.proxy_used : (proxy || null);
+
+        if (typeof parsed.status === "string" && parsed.status.match(/^\d+$/)) parsed.status = Number(parsed.status);
+
+        if (isDebug) addLog(`DEBUG callDiamanteAPI parsed: ${JSON.stringify(parsed)}`, "debug");
+        resolve(parsed);
       } catch (e) {
-        reject(new Error("Invalid JSON from python helper"));
+        const txt = (stderr && String(stderr).trim()) || String(stdout).slice(0, 200);
+        const resObj = { status: null, text: txt, json: null, headers: {}, error: true, proxy_used: proxy || null };
+        if (isDebug) addLog(`DEBUG callDiamanteAPI parse failed: ${JSON.stringify(resObj)}`, "debug");
+        resolve(resObj);
       }
     });
   });
+}
+
+function normalizeProxy(p) {
+  if (!p) return null;
+  let proxy = p.trim();
+  if (!/^https?:\/\//i.test(proxy) && !/^socks/i.test(proxy)) {
+    proxy = 'http://' + proxy;
+  }
+  return proxy;
+}
+
+function maskProxyForLog(p) {
+  if (!p) return "none";
+  return p.replace(/:\/\/([^@]+)@/, function(_, cred){
+    const user = cred.split(':')[0];
+    return `://${user}:****@`;
+  });
+}
+
+function getProxyForAccount(index) {
+  if (!Array.isArray(proxies) || proxies.length === 0) return null;
+  if (index < 0 || index >= proxies.length) return null;
+  const raw = proxies[index];
+  if (!raw) return null;
+  return normalizeProxy(raw);
 }
 
 
@@ -429,16 +427,17 @@ async function loginAccount(address, proxyUrl, useProxy = true) {
     let pyRes;
     try {
       const proxyArg = proxyUrl || "";
-      pyRes = await callCurlCffi(payload, proxyArg, "chrome110");
+      pyRes = await callCurlCffi(payload, proxyArg, "chrome120");
     } catch (e) {
       addLog(`Python helper call failed: ${e.message}`, "error");
       return false;
     }
 
-    if (pyRes.error) {
-      addLog(`curl_cffi error: ${pyRes.error}`, "error");
+    if (pyRes && pyRes.error && pyRes.error === "proxy_check_failed") {
+      addLog(`Account ${getShortAddress(checksummedAddress)}: Proxy failed connectivity check (${pyRes.detail || pyRes.text || pyRes.status_code}).`, "error");
       return false;
     }
+
 
     if (pyRes.status_code === 403 && typeof pyRes.text === "string" && pyRes.text.includes("Cloudflare")) {
       addLog(`Account ${getShortAddress(checksummedAddress)}: Blocked by Cloudflare`, "error");
@@ -670,7 +669,8 @@ async function runDailyActivity() {
     for (let accountIndex = 0; accountIndex < addresses.length && !shouldStop; accountIndex++) {
       addLog(`Starting processing for account ${accountIndex + 1}`, "info");
       selectedWalletIndex = accountIndex;
-      const proxyUrl = proxies[accountIndex % proxies.length] || null;
+      const proxyUrl = getProxyForAccount(accountIndex);
+
       addLog(`Account ${accountIndex + 1}: Using Proxy ${proxyUrl || "none"}...`, "info");
       const address = addresses[accountIndex];
       addLog(`Processing account ${accountIndex + 1}: ${getShortAddress(address)}`, "info");
