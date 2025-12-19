@@ -5,6 +5,13 @@ import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { getAddress } from 'ethers'; 
+import { execFile } from "child_process";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 
 const API_BASE_URL = "https://campapi.diamante.io/api/v1";
 const CONFIG_FILE = "config.json";
@@ -270,25 +277,44 @@ async function makeApiRequest(method, url, data, proxyUrl, customHeaders = {}, m
           data,
           headers,
           ...(agent ? { httpsAgent: agent, httpAgent: agent } : {}),
-          timeout: 10000,
-          withCredentials: true
+          timeout: 15000,
+          withCredentials: true,
+          validateStatus: null
         };
         const response = await axios(config);
-        return response;
+
+        const contentType = (response.headers && (response.headers['content-type'] || '')).toString();
+
+        if (response.status === 403 && contentType.includes('text/html')) {
+          addLog(`Request blocked by Cloudflare for ${url}`, "error");
+          return response;
+        }
+        if (response.status >= 200 && response.status < 300) {
+          return response;
+        }
+
+        lastError = new Error(`HTTP ${response.status} - ${JSON.stringify(response.data || response.statusText)}`);
+        throw lastError;
       } catch (error) {
+        if (error && error.response && error.response.status === 403 && ((error.response.headers['content-type'] || '').includes('text/html'))) {
+          addLog(`Blocked by Cloudflare for ${url}`, "error");
+          return error.response;
+        }
+
         lastError = error;
         let errorMessage = `Attempt ${attempt}/${maxRetries} failed for API request to ${url}`;
-        if (error.response) errorMessage += `: HTTP ${error.response.status} - ${JSON.stringify(error.response.data || error.response.statusText)}`;
-        else if (error.request) errorMessage += `: No response received`;
-        else errorMessage += `: ${error.message}`;
+        if (error && error.response) errorMessage += `: HTTP ${error.response.status} - ${JSON.stringify(error.response.data || error.response.statusText)}`;
+        else if (error && error.request) errorMessage += `: No response received`;
+        else errorMessage += `: ${error && error.message ? error.message : String(error)}`;
         addLog(errorMessage, "error");
+
         if (attempt < maxRetries) {
-          addLog(`Retrying API request in ${retryDelay/1000} seconds...`, "wait");
+          addLog(`Retrying API request in ${retryDelay/1000} seconds.`, "wait");
           await sleep(retryDelay);
         }
       }
     }
-    throw new Error(`Failed to make API request to ${url} after ${maxRetries} attempts: ${lastError.message}`);
+    throw new Error(`Failed to make API request to ${url} after ${maxRetries} attempts: ${lastError && lastError.message ? lastError.message : 'unknown'}`);
   } finally {
     activeProcesses = Math.max(0, activeProcesses - 1);
   }
@@ -320,6 +346,48 @@ async function updateWalletData() {
   return walletData;
 }
 
+function callCurlCffi(payload, proxy = null, impersonate = "chrome110") {
+  return new Promise((resolve, reject) => {
+    const script = path.join(__dirname, "connect.py");
+    const args = [JSON.stringify(payload), proxy || "", impersonate || ""];
+    execFile("python3", [script, ...args], { maxBuffer: 30 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        return reject(new Error(`callCurlCffi exec error: ${err.message} ${stderr || ""}`));
+      }
+      try {
+        const parsed = JSON.parse(stdout);
+        resolve(parsed);
+      } catch (e) {
+        return reject(new Error("Failed to parse python helper output: " + e.message + " | stdout: " + stdout));
+      }
+    });
+  });
+}
+
+function callDiamanteAPI(url, method, payload, headers, proxy) {
+  return new Promise((resolve, reject) => {
+    const script = path.join(__dirname, "api.py");
+    const args = [
+      url,
+      method,
+      payload ? JSON.stringify(payload) : "null",
+      JSON.stringify(headers || {}),
+      proxy || ""
+    ];
+
+    execFile("python3", [script, ...args], { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(err);
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        reject(new Error("Invalid JSON from python helper"));
+      }
+    });
+  });
+}
+
+
+
 async function loginAccount(address, proxyUrl, useProxy = true) {
   if (shouldStop) {
     addLog("Login stopped due to stop request.", "info");
@@ -330,89 +398,116 @@ async function loginAccount(address, proxyUrl, useProxy = true) {
     const checksummedAddress = getAddress(address);
     addLog(`Logging in with address: ${getShortAddress(address)})`, "debug");
 
-    let deviceId = accountData[checksummedAddress.toLowerCase()]; 
+    let deviceId = accountData[checksummedAddress.toLowerCase()];
     if (!deviceId) {
       deviceId = `DEV${Math.random().toString(24).substr(2, 5).toUpperCase()}`;
       addLog(`Generated new deviceId for ${getShortAddress(checksummedAddress)}: ${deviceId}`, "info");
     } else {
       addLog(`Using existing deviceId for ${getShortAddress(checksummedAddress)}: ${deviceId}`, "info");
     }
+
     const payload = {
-      "address": checksummedAddress,
-      "deviceId": deviceId,
-      "deviceSource": "web_app",
-      "deviceType": "Windows",
-      "browser": "Chrome",
-      "ipAddress": "0.0.0.0",
-      "latitude": 12.9715987,
-      "longitude": 77.5945627,
-      "countryCode": "Unknown",
-      "country": "Unknown",
-      "continent": "Unknown",
-      "continentCode": "Unknown",
-      "region": "Unknown",
-      "regionCode": "Unknown",
-      "city": "Unknown"
+      address: checksummedAddress,
+      deviceId: deviceId,
+      deviceSource: "web_app",
+      deviceType: "Windows",
+      browser: "Chrome",
+      ipAddress: "0.0.0.0",
+      latitude: 12.9715987,
+      longitude: 77.5945627,
+      countryCode: "Unknown",
+      country: "Unknown",
+      continent: "Unknown",
+      continentCode: "Unknown",
+      region: "Unknown",
+      regionCode: "Unknown",
+      city: "Unknown"
     };
-    const response = await makeApiRequest("post", loginUrl, payload, proxyUrl, {}, 3, 2000, useProxy);
-    if (response.data.success) {
-      const userId = response.data.data.userId;
-      const setCookie = response.headers['set-cookie'];
+    let pyRes;
+    try {
+      const proxyArg = proxyUrl || "";
+      pyRes = await callCurlCffi(payload, proxyArg, "chrome110");
+    } catch (e) {
+      addLog(`Python helper call failed: ${e.message}`, "error");
+      return false;
+    }
+
+    if (pyRes.error) {
+      addLog(`curl_cffi error: ${pyRes.error}`, "error");
+      return false;
+    }
+
+    if (pyRes.status_code === 403 && typeof pyRes.text === "string" && pyRes.text.includes("Cloudflare")) {
+      addLog(`Account ${getShortAddress(checksummedAddress)}: Blocked by Cloudflare`, "error");
+      return false;
+    }
+    const respJson = pyRes.json;
+    const respHeaders = pyRes.headers || {};
+    const status = pyRes.status_code;
+
+    if (status >= 200 && status < 300 && respJson) {
+      const data = respJson.data || respJson;
       let accessToken = null;
-      if (setCookie) {
-        const cookieStr = setCookie[0] || "";
-        const match = cookieStr.match(/access_token=([^;]+)/);
+      if (data && data.accessToken) accessToken = data.accessToken;
+      if (!accessToken && respHeaders["set-cookie"]) {
+        const sc = Array.isArray(respHeaders["set-cookie"]) ? respHeaders["set-cookie"][0] : respHeaders["set-cookie"];
+        const match = sc && sc.match && sc.match(/access_token=([^;]+)/);
         if (match) accessToken = match[1];
       }
+      if (!accessToken && data && data.user && data.user.accessToken) accessToken = data.user.accessToken;
+
       if (!accessToken) {
-        addLog(`Account ${getShortAddress(checksummedAddress)}: Failed to extract access_token from cookies.`, "error");
+        addLog(`Account ${getShortAddress(checksummedAddress)}: Failed to extract access_token from curl_cffi response.`, "error");
         return false;
       }
-      accountTokens[checksummedAddress] = { 
-        userId,
-        accessToken
-      };
+
+      const userId = data.userId || (data.user && data.user.userId) || (respJson.data && respJson.data.userId);
+      accountTokens[checksummedAddress] = { userId, accessToken };
+
       if (!accountData[checksummedAddress.toLowerCase()]) {
         accountData[checksummedAddress.toLowerCase()] = deviceId;
         saveAccountData();
       }
-      if (response.data.data.isSocialExists === "VERIFIED") {
+
+      const isSocial = (data && data.isSocialExists) || (respJson.data && respJson.data.isSocialExists);
+      if (isSocial === "VERIFIED") {
         addLog(`Account ${getShortAddress(checksummedAddress)}: Login Successfully`, "success");
         await updateWallets();
         return true;
-      } else if (response.data.data.isSocialExists === "INITIAL") {
+      } else if (isSocial === "INITIAL") {
         addLog(`Account ${getShortAddress(checksummedAddress)}: Not Registered Yet.`, "error");
         return false;
       } else {
-        addLog(`Account ${getShortAddress(checksummedAddress)}: Unexpected state: ${response.data.data.isSocialExists}`, "error");
+        addLog(`Account ${getShortAddress(checksummedAddress)}: Unexpected state: ${isSocial}`, "error");
         return false;
       }
     } else {
-      addLog(`Account ${getShortAddress(checksummedAddress)}: Login failed: ${response.data.message}`, "error");
+      addLog(`Account ${getShortAddress(checksummedAddress)}: Login failed. status=${status}`, "error");
       return false;
     }
+
   } catch (error) {
-    addLog(`Account ${getShortAddress(address)}: Login error: ${error.message}`, "error");
+    addLog(`Account ${getShortAddress(address)}: Login error: ${error && error.message ? error.message : String(error)}`, "error");
     return false;
   }
 }
 
 async function getBalance(userId, proxyUrl, address) {
-  try {
-    const balanceUrl = `${API_BASE_URL}/transaction/get-balance/${userId}`;
-    const headers = {
-      "Cookie": `access_token=${accountTokens[address].accessToken}`
-    };
-    const response = await makeApiRequest("get", balanceUrl, null, proxyUrl, headers);
-    if (response.data.success) {
-      return response.data.data;
-    } else {
-      throw new Error(response.data.message);
-    }
-  } catch (error) {
-    addLog(`Failed to get balance: ${error.message}`, "error");
-    return { balance: 0 };
+  const url = `${API_BASE_URL}/transaction/get-balance/${userId}`;
+  const headers = {
+    "Cookie": `access_token=${accountTokens[address].accessToken}`,
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://campaign.diamante.io",
+    "Referer": "https://campaign.diamante.io/"
+  };
+
+  const res = await callDiamanteAPI(url, "GET", null, headers, proxyUrl);
+
+  if (res.status === 200 && res.json?.success) {
+    return res.json.data;
   }
+
+  throw new Error("Failed get balance");
 }
 
 async function claimFaucetForAccount(address, proxyUrl, accountIndex) {
@@ -422,53 +517,93 @@ async function claimFaucetForAccount(address, proxyUrl, accountIndex) {
     addLog(`Account ${accountIndex + 1}: No userId available for faucet claim.`, "error");
     return;
   }
-  let maxRetries = 10;
-  let retryDelay = 5000;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+
+  const maxRetries = 8;
+  const delays = [2000, 3000, 5000, 8000, 12000, 20000, 30000, 45000];
+
+  for (let attempt = 0; attempt < maxRetries && !shouldStop; attempt++) {
     try {
       const faucetUrl = `${API_BASE_URL}/transaction/fund-wallet/${userId}`;
       const headers = {
-        "Cookie": `access_token=${accountTokens[address].accessToken}`
+        "Cookie": `access_token=${accountTokens[address].accessToken}`,
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://campaign.diamante.io",
+        "Referer": "https://campaign.diamante.io/"
       };
-      const response = await makeApiRequest("get", faucetUrl, null, proxyUrl, headers);
-      if (response.data.success) {
-        addLog(`Account ${accountIndex + 1}: DIAM faucet claimed successfully. Funded: ${response.data.data.fundedAmount}`, "success");
+
+      const res = await callDiamanteAPI(faucetUrl, "GET", null, headers, proxyUrl);
+
+      if (res.status === 200 && res.json && res.json.success) {
+        addLog(`Account ${accountIndex + 1}: DIAM faucet claimed successfully. Funded: ${res.json.data.fundedAmount}`, "success");
         await updateWallets();
         return;
-      } else {
-        if (response.data.message.includes("You can claim from the faucet once per day")) {
-          addLog(`Account ${accountIndex + 1}: ${response.data.message}`, "wait");
-          return;
-        }
-        addLog(`Account ${accountIndex + 1}: Faucet claim attempt ${attempt} failed: ${response.data.message}`, "error");
       }
-    } catch (error) {
-      addLog(`Account ${accountIndex + 1}: Faucet claim attempt ${attempt} error: ${error.message}`, "error");
+
+      const message = (res.json && (res.json.message || res.json.data?.message)) || (res.text || `HTTP ${res.status}`);
+
+      if (typeof message === "string" && message.includes("You can claim from the faucet once per day")) {
+        addLog(`Account ${accountIndex + 1}: ${message}`, "wait");
+        return;
+      }
+      const retryable = (
+        res.status >= 500 ||
+        (res.json && (res.json.status === 429 || res.json.status === "429")) ||
+        /guardians|syncing|rate limit|too many/i.test(message)
+      );
+
+      addLog(`Account ${accountIndex + 1}: Faucet attempt ${attempt + 1} returned: ${message}`, retryable ? "wait" : "error");
+
+      if (!retryable) return;
+
+    } catch (err) {
+      addLog(`Account ${accountIndex + 1}: Faucet attempt error: ${err.message || String(err)}`, "error");
     }
-    if (attempt < maxRetries) {
-      addLog(`Account ${accountIndex + 1}: Retrying faucet claim in ${retryDelay / 1000} seconds...`, "wait");
-      await sleep(retryDelay);
+
+    if (attempt < maxRetries - 1 && !shouldStop) {
+      const d = delays[Math.min(attempt, delays.length - 1)];
+      addLog(`Account ${accountIndex + 1}: Retrying faucet in ${Math.round(d/1000)}s...`, "wait");
+      await sleep(d);
     }
   }
-  addLog(`Account ${accountIndex + 1}: Failed to claim faucet after ${maxRetries} attempts.`, "error");
+
+  addLog(`Account ${accountIndex + 1}: Failed to claim faucet after retries.`, "error");
 }
 
+
 async function getTweetContent(userId, proxyUrl, address) {
-  try {
-    const tweetUrl = `${API_BASE_URL}/transaction/tweet-content/${userId}`;
-    const headers = {
-      "Cookie": `access_token=${accountTokens[address].accessToken}`
-    };
-    const response = await makeApiRequest("get", tweetUrl, null, proxyUrl, headers);
-    if (response.data.success) {
-      addLog(`Tweet Content: ${response.data.data.content}`, "debug");
-    } else {
-      addLog(`Failed to get tweet content: ${response.data.message}`, "error");
+  const maxRetries = 5;
+  for (let attempt = 0; attempt < maxRetries && !shouldStop; attempt++) {
+    try {
+      const tweetUrl = `${API_BASE_URL}/transaction/tweet-content/${userId}`;
+      const headers = {
+        "Cookie": `access_token=${accountTokens[address].accessToken}`,
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://campaign.diamante.io",
+        "Referer": "https://campaign.diamante.io/"
+      };
+
+      const res = await callDiamanteAPI(tweetUrl, "GET", null, headers, proxyUrl);
+      if (res.status === 200 && res.json && res.json.success) {
+        addLog(`Tweet Content: ${res.json.data.content}`, "debug");
+        return res.json.data;
+      }
+
+      const message = res.json?.message || res.text || `HTTP ${res.status}`;
+      addLog(`Tweet content attempt ${attempt+1} failed: ${message}`, "debug");
+
+      if (attempt < maxRetries - 1) {
+        await sleep(2000 + attempt * 2000);
+        continue;
+      }
+      return null;
+    } catch (err) {
+      addLog(`Tweet content request error: ${err.message || String(err)}`, "error");
+      if (attempt < maxRetries - 1) await sleep(3000);
     }
-  } catch (error) {
-    addLog(`Tweet content request error: ${error.message}`, "error");
   }
+  return null;
 }
+
 
 async function performSendDiam(address, proxyUrl, recipient, amount) {
   const userId = accountTokens[address]?.userId;
@@ -476,31 +611,63 @@ async function performSendDiam(address, proxyUrl, recipient, amount) {
     addLog(`No userId for send DIAM.`, "error");
     return false;
   }
-  try {
-    const sendUrl = `${API_BASE_URL}/transaction/transfer`;
-    const payload = {
-      "toAddress": recipient, 
-      "amount": amount,
-      "userId": userId
-    };
-    const headers = {
-      "Cookie": `access_token=${accountTokens[address].accessToken}`,
-      "Content-Type": "application/json"
-    };
-    const response = await makeApiRequest("post", sendUrl, payload, proxyUrl, headers);
-    if (response.data.success) {
-      addLog(`Sent ${amount} DIAM to ${getShortAddress(recipient)}. Hash: ${getShortHash(response.data.data.transferData.hash)}`, "success");
-      await updateWallets();
-      await getTweetContent(userId, proxyUrl, address);
-      return true;
+
+  const sendUrl = `${API_BASE_URL}/transaction/transfer`;
+  const payload = {
+    toAddress: recipient,
+    amount: amount,
+    userId: userId
+  };
+  const headers = {
+    "Cookie": `access_token=${accountTokens[address].accessToken}`,
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://campaign.diamante.io",
+    "Referer": "https://campaign.diamante.io/"
+  };
+
+  const maxRetries = 6;
+  const delays = [2000, 4000, 8000, 15000, 30000, 60000]; 
+
+  for (let attempt = 0; attempt < maxRetries && !shouldStop; attempt++) {
+    try {
+      const res = await callDiamanteAPI(sendUrl, "POST", payload, headers, proxyUrl);
+      if (res.status === 200 && res.json && (res.json.success === true || res.json.message === "Success")) {
+        const hash = res.json.data?.transferData?.hash || res.json.data?.hash || "(no-hash)";
+        addLog(`Sent ${amount} DIAM to ${getShortAddress(recipient)}. Hash: ${hash}`, "success");
+        await updateWallets();
+        await getTweetContent(userId, proxyUrl, address);
+        return true;
+      }
+
+      const message = (res.json && (res.json.message || res.json.data?.message)) || (res.text || `HTTP ${res.status}`);
+      addLog(`Send attempt ${attempt + 1} returned: ${message}`, "error");
+
+      const retryable = (
+        res.status >= 500 ||
+        (res.json && (res.json.status === 429 || String(res.json.status).includes("429"))) ||
+        /guardians|syncing|sync|pending|transaction pending|try again/i.test(String(message))
+      );
+
+      if (!retryable) {
+        addLog(`Send Transaction Failed: ${message}`, "error");
+        return false;
+      }
+
+    } catch (err) {
+      addLog(`Send attempt ${attempt + 1} error: ${err.message || String(err)}`, "error");
+    }
+    if (attempt < maxRetries - 1 && !shouldStop) {
+      const d = delays[Math.min(attempt, delays.length - 1)];
+      addLog(`Send Failed , Retryin ${attempt + 1}/${maxRetries} in ${Math.round(d/1000)}s...`, "wait");
+      await sleep(d);
     } else {
-      addLog(`Send failed: ${response.data.message}`, "error");
+      addLog(`Send failed after ${maxRetries} attempts.`, "error");
       return false;
     }
-  } catch (error) {
-    addLog(`Send DIAM failed: ${error.message}`, "error");
-    return false;
   }
+
+  return false;
 }
 
 async function runDailyActivity() {
